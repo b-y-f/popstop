@@ -7,6 +7,8 @@
  * gap after an active popping run. It is a reminder, never a microwave control.
  */
 
+const { PoppingPhaseTracker } = window.PopStopLogic;
+
 const els = {
   listenCard: document.querySelector("#listenCard"),
   signalOrb: document.querySelector("#signalOrb"),
@@ -55,11 +57,7 @@ const state = {
   status: "idle",
   preference: "balanced",
   calibrationOffset: loadCalibration(),
-  events: [],
-  lastPopAt: null,
-  peakRate: 0,
-  rateAtPeak: 0,
-  rapidPhaseSeen: false,
+  tracker: new PoppingPhaseTracker(),
   audioContext: null,
   analyser: null,
   stream: null,
@@ -141,60 +139,43 @@ function setIdleStatus() {
   els.waveLabel.hidden = false;
 }
 
-function updateMetrics(now = performance.now()) {
-  els.popCount.textContent = String(state.events.length);
-  els.peakRate.textContent = state.peakRate > 0 ? String(Math.round(state.peakRate)) : "—";
+function updateMetrics(now = performance.now(), snapshot = state.tracker.snapshot(now)) {
+  els.popCount.textContent = String(snapshot.eventCount);
+  els.peakRate.textContent = snapshot.peakRate > 0 ? String(Math.round(snapshot.peakRate)) : "—";
 
-  if (!state.lastPopAt) {
+  if (!snapshot.lastPopAt) {
     els.lastGap.textContent = "—";
     return 0;
   }
 
-  const gap = Math.max(0, (now - state.lastPopAt) / 1000);
+  const gap = snapshot.gapMs / 1000;
   els.lastGap.textContent = gap < 10 ? gap.toFixed(1) : "10+";
   return gap;
-}
-
-function getRate(now, windowMs = 10000) {
-  return state.events.filter((eventAt) => now - eventAt <= windowMs).length * (60000 / windowMs);
-}
-
-function hasActivePoppingHistory() {
-  if (state.events.length < 5) return false;
-  const recentIntervals = [];
-  for (let index = 1; index < state.events.length; index += 1) {
-    const interval = (state.events[index] - state.events[index - 1]) / 1000;
-    if (interval < 8) recentIntervals.push(interval);
-  }
-  const lastIntervals = recentIntervals.slice(-6);
-  const quickIntervals = lastIntervals.filter((interval) => interval <= 1.8).length;
-  return state.rapidPhaseSeen || quickIntervals >= 3 || state.peakRate >= 24;
 }
 
 function evaluatePoppingState(now) {
   if (!state.isListening || state.isCalibrating) return;
 
-  const gap = updateMetrics(now);
-  const currentRate = getRate(now);
-  const activeHistory = hasActivePoppingHistory();
   const targetGap = currentTargetGap();
+  const snapshot = state.tracker.tick(now, targetGap);
+  const gap = updateMetrics(now, snapshot);
 
-  if (!state.lastPopAt) {
+  if (!snapshot.lastPopAt) {
     setStatus("listening", state.isDemo ? "演示正在进行" : "正在监听", "等第一声爆裂", "环境基线已建立。保持手机靠近炉外，并尽量减少其他声音。");
     return;
   }
 
-  if (state.events.length < 5) {
+  if (snapshot.phase === "observing" && snapshot.eventCount < state.tracker.config.minEventsToArm) {
     setStatus("listening", state.isDemo ? "演示正在进行" : "正在监听", "正在认识这一炉", "已经听到爆裂声；再多听一会儿，才能判断节奏变化。");
     return;
   }
 
-  if (!activeHistory) {
-    setStatus("listening", state.isDemo ? "演示正在进行" : "正在监听", "爆裂还在累积", "还没看到足够活跃的爆裂段，继续监听。");
+  if (snapshot.phase === "observing") {
+    setStatus("listening", state.isDemo ? "演示正在进行" : "正在监听", "等待稳定活跃段", "需要连续观察到两段密集爆裂，才会把这一炉交给停机判断。");
     return;
   }
 
-  if (gap >= targetGap) {
+  if (snapshot.phase === "prompted") {
     if (!state.hasPromptedStop) {
       state.hasPromptedStop = true;
       setStatus("stop", "低焦糊风险窗口", "建议现在停止微波炉", `距上一声爆裂 ${gap.toFixed(1)} 秒，已超过本轮 ${targetGap.toFixed(1)} 秒提醒阈值。`);
@@ -206,8 +187,8 @@ function evaluatePoppingState(now) {
     return;
   }
 
-  if (gap >= targetGap * 0.7 || currentRate < state.rateAtPeak * 0.62) {
-    setStatus("ready", "接近提醒窗口", "准备停机", `爆裂节奏正在变慢；若下一声仍未到，约 ${Math.max(0, targetGap - gap).toFixed(1)} 秒后会提醒你。`);
+  if (snapshot.phase === "slowing") {
+    setStatus("ready", "已确认减速", "准备停机", `已看到活跃爆裂后的持续回落；若下一声仍未到，约 ${Math.max(0, targetGap - gap).toFixed(1)} 秒后会提醒你。`);
     return;
   }
 
@@ -215,37 +196,18 @@ function evaluatePoppingState(now) {
 }
 
 function registerPop(timestamp = performance.now()) {
-  if (!state.isListening) return;
+  if (!state.isListening || state.tracker.phase === "prompted") return;
 
-  const previousPop = state.lastPopAt;
-  state.events.push(timestamp);
-  state.lastPopAt = timestamp;
-  state.events = state.events.filter((eventAt) => timestamp - eventAt <= 180000);
-
-  if (previousPop && (timestamp - previousPop) / 1000 <= 1.8) {
-    state.rapidPhaseSeen = true;
-  }
-
-  const rate = getRate(timestamp);
-  if (rate > state.peakRate) {
-    state.peakRate = rate;
-    state.rateAtPeak = rate;
-  }
-
-  state.hasPromptedStop = false;
+  const snapshot = state.tracker.recordPop(timestamp, currentTargetGap());
   els.signalOrb.classList.add("is-pop");
   window.setTimeout(() => els.signalOrb.classList.remove("is-pop"), 180);
   els.waveLabel.hidden = true;
-  updateMetrics(timestamp);
+  updateMetrics(timestamp, snapshot);
   evaluatePoppingState(timestamp);
 }
 
 function resetRound() {
-  state.events = [];
-  state.lastPopAt = null;
-  state.peakRate = 0;
-  state.rateAtPeak = 0;
-  state.rapidPhaseSeen = false;
+  state.tracker.reset();
   state.hasPromptedStop = false;
   state.lastFramePeak = 0;
   state.lastHighEnergy = 0;
@@ -350,7 +312,7 @@ function analyseFrame(timestamp) {
   const highEnergyRise = highEnergy - state.lastHighEnergy;
   const sharpRise = peak - state.lastFramePeak;
   const now = performance.now();
-  const sufficientBreak = !state.lastPopAt || now - state.lastPopAt > 170;
+  const sufficientBreak = !state.tracker.lastPopAt || now - state.tracker.lastPopAt > 170;
   const candidate =
     rms > threshold &&
     peak > peakThreshold &&
@@ -481,7 +443,7 @@ function stopListening({ keepFeedback = true } = {}) {
   els.waveLabel.textContent = "本轮监听已结束";
   els.waveLabel.hidden = false;
 
-  if (keepFeedback && state.events.length >= 3) {
+  if (keepFeedback && state.tracker.eventCount >= 3) {
     els.feedbackCard.hidden = false;
     if (!state.hasPromptedStop) {
       els.feedbackPrompt.textContent = "即使你是手动停的，这个结果也能帮助下次更贴近你的微波炉。";
