@@ -8,6 +8,7 @@
  */
 
 const { PoppingPhaseTracker } = window.PopStopLogic;
+const { PopAudioDetector } = window.PopStopAudio;
 
 const els = {
   listenCard: document.querySelector("#listenCard"),
@@ -64,13 +65,12 @@ const state = {
   timeData: null,
   frequencyData: null,
   animationId: null,
-  lastFramePeak: 0,
-  lastHighEnergy: 0,
   noiseFloor: 0.006,
   initialNoiseSamples: [],
   calibrationStartedAt: 0,
   isCalibrating: false,
-  detectorArmed: true,
+  audioDetector: new PopAudioDetector(),
+  previousFrequencyData: null,
   demoTimers: [],
   wakeLock: null,
   visualSamples: Array.from({ length: 60 }, () => 0.05),
@@ -97,11 +97,14 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
-function median(values) {
+function percentile(values, ratio) {
   if (!values.length) return 0;
   const ordered = [...values].sort((a, b) => a - b);
-  const middle = Math.floor(ordered.length / 2);
-  return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2;
+  const position = clamp(ratio, 0, 1) * (ordered.length - 1);
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  const fraction = position - lower;
+  return ordered[lower] * (1 - fraction) + ordered[upper] * fraction;
 }
 
 function currentTargetGap() {
@@ -208,12 +211,11 @@ function registerPop(timestamp = performance.now()) {
 
 function resetRound() {
   state.tracker.reset();
+  state.audioDetector.reset();
   state.hasPromptedStop = false;
-  state.lastFramePeak = 0;
-  state.lastHighEnergy = 0;
   state.noiseFloor = 0.006;
   state.initialNoiseSamples = [];
-  state.detectorArmed = true;
+  state.previousFrequencyData = null;
   state.visualSamples = Array.from({ length: 60 }, () => 0.05);
   els.feedbackCard.hidden = true;
   els.feedbackPrompt.textContent = "你的反馈只会保存在这台设备，用来微调下次提醒。";
@@ -285,19 +287,34 @@ function analyseFrame(timestamp) {
   }
   const rms = Math.sqrt(sumSquares / state.timeData.length);
 
-  // Popcorn snaps are usually brief and broadband. High-frequency energy helps
-  // reject a few low, steady kitchen sounds without pretending this is a model.
-  const highStart = Math.floor(state.frequencyData.length * 0.18);
+  // Popcorn snaps are brief and broadband. Compare the useful mid/high band
+  // with the previous frame so a muffled snap can still pass on spectral onset.
+  const highStart = Math.max(2, Math.floor(state.frequencyData.length * 0.035));
+  const highEnd = Math.floor(state.frequencyData.length * 0.62);
   let highEnergy = 0;
-  for (let index = highStart; index < state.frequencyData.length; index += 1) {
+  let spectralFlux = 0;
+  for (let index = highStart; index < highEnd; index += 1) {
     highEnergy += state.frequencyData[index] / 255;
+    if (state.previousFrequencyData) {
+      spectralFlux += Math.max(
+        0,
+        (state.frequencyData[index] - state.previousFrequencyData[index]) / 255,
+      );
+    }
   }
-  highEnergy /= state.frequencyData.length - highStart;
+  highEnergy /= highEnd - highStart;
+  spectralFlux /= highEnd - highStart;
+  if (!state.previousFrequencyData) {
+    state.previousFrequencyData = new Uint8Array(state.frequencyData.length);
+  }
+  state.previousFrequencyData.set(state.frequencyData);
 
   if (state.isCalibrating) {
     state.initialNoiseSamples.push(rms);
     if (timestamp - state.calibrationStartedAt >= 2400) {
-      state.noiseFloor = Math.max(0.0018, median(state.initialNoiseSamples));
+      // A lower percentile ignores phone-handling clicks or an early isolated pop.
+      state.noiseFloor = Math.max(0.0008, percentile(state.initialNoiseSamples, 0.3));
+      state.audioDetector.reset(state.noiseFloor);
       state.isCalibrating = false;
       els.waveLabel.hidden = true;
       setStatus("listening", "正在监听", "等第一声爆裂", "环境基线已建立。保持手机靠近炉外，并尽量减少其他声音。");
@@ -307,33 +324,21 @@ function analyseFrame(timestamp) {
     return;
   }
 
-  const threshold = Math.max(0.012, state.noiseFloor * 3.25 + 0.003);
-  const peakThreshold = Math.max(0.026, threshold * 1.45);
-  const highEnergyRise = highEnergy - state.lastHighEnergy;
-  const sharpRise = peak - state.lastFramePeak;
-  const now = performance.now();
-  const sufficientBreak = !state.tracker.lastPopAt || now - state.tracker.lastPopAt > 170;
-  const candidate =
-    rms > threshold &&
-    peak > peakThreshold &&
-    sufficientBreak &&
-    state.detectorArmed &&
-    (highEnergyRise > 0.008 || sharpRise > threshold * 0.45);
+  const now = timestamp;
+  const detection = state.audioDetector.processFrame({
+    timestamp: now,
+    rms,
+    peak,
+    highEnergy,
+    spectralFlux,
+  });
+  const candidate = detection.detected;
+  state.noiseFloor = detection.noiseFloor;
 
   if (candidate) {
-    state.detectorArmed = false;
     registerPop(now);
   }
 
-  if (rms < threshold * 0.68) state.detectorArmed = true;
-
-  // Update the baseline slowly only when the frame is plausibly background sound.
-  if (!candidate && rms < Math.max(threshold * 1.18, state.noiseFloor * 2.1)) {
-    state.noiseFloor = state.noiseFloor * 0.992 + rms * 0.008;
-  }
-
-  state.lastFramePeak = peak;
-  state.lastHighEnergy = highEnergy;
   drawWave(rms, candidate);
   evaluatePoppingState(now);
   state.animationId = requestAnimationFrame(analyseFrame);
@@ -390,6 +395,7 @@ async function startListening() {
     source.connect(state.analyser);
     state.timeData = new Float32Array(state.analyser.fftSize);
     state.frequencyData = new Uint8Array(state.analyser.frequencyBinCount);
+    state.previousFrequencyData = new Uint8Array(state.analyser.frequencyBinCount);
     state.isListening = true;
     state.isDemo = false;
     state.isCalibrating = true;
